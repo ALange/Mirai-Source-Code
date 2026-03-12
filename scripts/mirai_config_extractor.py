@@ -349,12 +349,17 @@ class ELFParser:
     def exec_sections(self) -> List[ELFSection]:
         """Return executable sections (typically .text)."""
         return [s for s in self.sections
-                if s.is_exec and s.sh_type in (1, 0) and s.size > 0]
+                if s.is_exec and s.sh_type == 1 and s.size > 0]
 
     def alloc_data_sections(self) -> List[ELFSection]:
-        """Return allocated non-exec sections (.data, .rodata, .bss …)."""
+        """Return allocated non-exec sections with file data (.data, .rodata …).
+
+        SHT_NOBITS sections (.bss, sh_type=8) occupy no space in the file and
+        are therefore excluded – they cannot contain encrypted config strings.
+        """
         return [s for s in self.sections
-                if s.is_alloc and not s.is_exec and s.size > 0]
+                if s.is_alloc and not s.is_exec and s.size > 0
+                and s.sh_type != 8]
 
     def read_at_vaddr(self, vaddr: int, size: int) -> Optional[bytes]:
         """Read ``size`` bytes at a virtual address via section offsets."""
@@ -767,8 +772,10 @@ def find_key_in_data(parser: ELFParser, binary: bytes,
     Scan every allocated ELF section for the literal 4-byte ``table_key``
     value.  Both little-endian and big-endian representations are checked.
 
-    Prefers well-known Mirai keys when found; otherwise returns the first
-    4-byte aligned value in .data that matches a plausible key pattern.
+    Prefers well-known Mirai keys when found; otherwise scores each candidate
+    4-byte value against known plaintext prefixes to avoid returning the wrong
+    key (e.g. a repeated pointer or string constant that happens to occupy a
+    data section).
     """
     # First pass: look for well-known keys verbatim anywhere in the binary
     for k in _WELL_KNOWN_KEYS:
@@ -779,9 +786,12 @@ def find_key_in_data(parser: ELFParser, binary: bytes,
                 print(f"  [data-scan] Well-known key {k:#010x} found in binary")
             return k
 
-    # Second pass: scan aligned .data positions for any 4-byte value that,
-    # combined with endianness, produces a non-trivial combined XOR byte
-    candidates: Dict[int, int] = {}  # key32 → count
+    # Second pass: score each 4-byte aligned value in allocated data sections
+    # by checking how many known-plaintext encrypted prefixes it produces that
+    # are actually present in the binary.  A correct table_key will cause many
+    # such hits; an unrelated constant will cause few or none.
+    best_key: Optional[int] = None
+    best_score = 0
     for sec in parser.alloc_data_sections():
         data = parser.section_data(sec)
         for off in range(0, len(data) - 3, 4):
@@ -793,15 +803,21 @@ def find_key_in_data(parser: ELFParser, binary: bytes,
                 xb = compute_xor_byte(val)
                 if xb == 0:
                     continue  # degenerate key (no obfuscation)
-                candidates[val] = candidates.get(val, 0) + 1
+                # Score: count how many known encrypted prefixes (for this
+                # combined XOR byte) appear verbatim in the binary.
+                score = sum(
+                    1 for enc_prefix, xb2 in _KNOWN_ENC_PREFIXES
+                    if xb2 == xb and enc_prefix in binary
+                )
+                if score > best_score:
+                    best_score = score
+                    best_key = val
 
-    if candidates:
-        # Return the most frequently occurring candidate
-        best = max(candidates, key=lambda v: candidates[v])
+    if best_key is not None and best_score > 0:
         if verbose:
-            print(f"  [data-scan] Most common candidate key: {best:#010x} "
-                  f"(×{candidates[best]})")
-        return best
+            print(f"  [data-scan] Best candidate key: {best_key:#010x} "
+                  f"(plaintext prefix matches: {best_score})")
+        return best_key
 
     return None
 
@@ -957,19 +973,32 @@ def extract_encrypted_strings(
     binary: bytes,
     xor_byte: int,
     min_len: int = 3,
+    regions: Optional[List[Tuple[int, int]]] = None,
 ) -> List[Tuple[int, bytes, str]]:
     """
     Scan *binary* for XOR-encoded null-terminated ASCII strings.
 
     The encrypted null byte is always ``xor_byte`` itself (since
-    ``0x00 ^ xor_byte == xor_byte``).  The algorithm makes a single
-    forward pass, collecting maximal runs of bytes that:
+    ``0x00 ^ xor_byte == xor_byte``).  The algorithm makes a forward pass
+    over each region, collecting maximal runs of bytes that:
 
       * are NOT equal to ``xor_byte`` (i.e. not an encrypted null), AND
+      * are NOT a literal ``0x00`` byte (raw nulls in the file are padding or
+        code, not encrypted config bytes, and would otherwise decode to
+        ``xor_byte`` which is often printable – e.g. 0x22 = '"'), AND
       * decrypt (XOR with ``xor_byte``) to a printable ASCII character.
 
     Each such run that is immediately followed by ``xor_byte`` and is at
     least ``min_len`` bytes long is treated as one encrypted config string.
+
+    Parameters
+    ----------
+    regions:
+        Optional list of ``(file_offset, byte_length)`` pairs that restrict
+        the scan to specific byte ranges (e.g. ELF ``.rodata`` / ``.data``
+        sections).  When ``None`` the entire binary is scanned.  Restricting
+        to allocated data sections eliminates false positives caused by the
+        ELF header, zero-padded code sections, and other non-data regions.
 
     Returns a deduplicated list of ``(file_offset, raw_enc_bytes, decrypted_str)``.
     """
@@ -977,40 +1006,51 @@ def extract_encrypted_strings(
     seen: Dict[str, bool] = {}
     results: List[Tuple[int, bytes, str]] = []
 
-    run_start: Optional[int] = None
-    i = 0
-    n = len(binary)
+    def _scan(base: int, data: bytes) -> None:
+        run_start: Optional[int] = None
+        for rel_i, b in enumerate(data):
+            abs_i = base + rel_i
 
-    while i < n:
-        b = binary[i]
-
-        if b == enc_null:
-            # Encrypted null terminator – ends the current run (if any).
-            if run_start is not None:
-                length = i - run_start
-                if length >= min_len:
-                    raw = binary[run_start:i]
-                    dec = decrypt_bytes(raw, xor_byte)
-                    # Require high ASCII printability (tolerate a few
-                    # non-printable bytes in long strings, e.g. embedded
-                    # control chars from attack payloads).
-                    if _ascii_score(dec) >= 0.85:
-                        s = dec.decode("utf-8", errors="replace")
-                        if s not in seen:
-                            seen[s] = True
-                            results.append((run_start, raw, s))
+            if b == enc_null:
+                # Encrypted null terminator – ends the current run (if any).
+                if run_start is not None:
+                    length = abs_i - run_start
+                    if length >= min_len:
+                        raw = binary[run_start:abs_i]
+                        dec = decrypt_bytes(raw, xor_byte)
+                        # Require high ASCII printability (tolerate a few
+                        # non-printable bytes in long strings, e.g. embedded
+                        # control chars from attack payloads).
+                        if _ascii_score(dec) >= 0.85:
+                            s = dec.decode("utf-8", errors="replace")
+                            if s not in seen:
+                                seen[s] = True
+                                results.append((run_start, raw, s))
                 run_start = None
-        else:
-            dec_b = b ^ xor_byte
-            if 0x20 <= dec_b <= 0x7E or dec_b in (0x09, 0x0A, 0x0D):
-                # Printable byte – start or continue a run.
-                if run_start is None:
-                    run_start = i
+            elif b == 0x00:
+                # Literal null byte in the file: not an encrypted config byte.
+                # Without this guard, 0x00 XOR xor_byte often equals a
+                # printable character (e.g. 0x00 ^ 0x22 = 0x22 = '"'),
+                # causing runs to bleed across zero-padded regions and merge
+                # ELF-header / code-section garbage with real config strings.
+                run_start = None
             else:
-                # Non-printable byte – break any active run.
-                run_start = None
+                dec_b = b ^ xor_byte
+                if 0x20 <= dec_b <= 0x7E or dec_b in (0x09, 0x0A, 0x0D):
+                    # Printable byte – start or continue a run.
+                    if run_start is None:
+                        run_start = abs_i
+                else:
+                    # Non-printable byte – break any active run.
+                    run_start = None
 
-        i += 1
+    if regions:
+        for off, size in regions:
+            end = min(off + size, len(binary))
+            if off < end:
+                _scan(off, binary[off:end])
+    else:
+        _scan(0, binary)
 
     return results
 
@@ -1268,7 +1308,16 @@ def main() -> int:
             )
 
     # ---- Extract and display ------------------------------------------
-    results = extract_encrypted_strings(binary, xor_byte, min_len=args.min_len)
+    # For ELF binaries restrict scanning to allocated data sections
+    # (.rodata, .data, etc.) so that the ELF header, code sections, and
+    # zero-padded regions do not produce false-positive strings.
+    scan_regions: Optional[List[Tuple[int, int]]] = None
+    if parser and parser.valid:
+        data_secs = parser.alloc_data_sections()
+        if data_secs:
+            scan_regions = [(sec.offset, sec.size) for sec in data_secs]
+    results = extract_encrypted_strings(
+        binary, xor_byte, min_len=args.min_len, regions=scan_regions)
     display_results(results, xor_byte, key32, key_source, args.binary, parser)
     return 0
 
